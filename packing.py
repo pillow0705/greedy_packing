@@ -21,17 +21,21 @@ from physics import solve_three_spheres, check_collision, check_single_collision
 
 
 class GreedyPacking:
-    def __init__(self, diameters=(0.8, 1.2), collision_tol=0.02, max_candidates=600):
+    def __init__(self, diameters=(0.8, 1.2), collision_tol=0.02,
+                 max_candidates=600, local_radius_factor=3.0):
         """
         Parameters
         ----------
-        diameters      : tuple，允许的球直径列表（随机等概率选取）
-        collision_tol  : 相对碰撞容差，|gap| < tol * r_sum 视为接触
-        max_candidates : 候选集上限；超出时随机保留，防止 O(N³) 慢化
+        diameters           : tuple，允许的球直径列表
+        collision_tol       : 相对碰撞容差，|gap| < tol * r_sum 视为接触
+        max_candidates      : 候选集上限；超出时随机保留，防止 O(N³) 慢化
+        local_radius_factor : 局部密度邻域半径 = factor × (r_new + r_avg)
+                              值越大越"全局"，越小越局部
         """
-        self.diameters      = np.array(diameters)
-        self.tol            = collision_tol
-        self.max_candidates = max_candidates
+        self.diameters           = np.array(diameters)
+        self.tol                 = collision_tol
+        self.max_candidates      = max_candidates
+        self.local_radius_factor = local_radius_factor
 
         # 粒子状态
         self.positions = []   # list of np.ndarray (3,)
@@ -106,22 +110,24 @@ class GreedyPacking:
         best_phi  = -1.0
         best_cand = None
 
+        # 预计算当前球体积总和（加速）
+        cur_sphere_vol = float(np.sum(
+            (4.0 / 3.0) * np.pi * np.array(self.radii)**3
+        )) if self.radii else 0.0
+
         for idx, cand in enumerate(self._candidates):
             sol   = cand['position']
             r_new = cand['radius']
 
             # 碰撞检测
             collision, _ = check_collision(
-                sol, r_new,
-                self.positions, self.radii, self.tol
+                sol, r_new, self.positions, self.radii, self.tol
             )
             if collision:
                 continue
 
-            # 假设放置后计算 phi
-            tmp_positions = self.positions + [sol]
-            tmp_radii     = self.radii     + [r_new]
-            phi = self._compute_phi_for(tmp_positions, tmp_radii)
+            # 全局包围盒 phi（加入候选后）
+            phi = self._bbox_phi_incremental(sol, r_new, cur_sphere_vol)
 
             if phi > best_phi:
                 best_phi  = phi
@@ -196,6 +202,13 @@ class GreedyPacking:
     # 内部辅助
     # ------------------------------------------------------------------
 
+    @property
+    def _centroid(self):
+        """当前所有粒子的质心。"""
+        if not self.positions:
+            return np.zeros(3)
+        return np.mean(self.positions, axis=0)
+
     def _add_particle(self, pos, radius):
         self.positions.append(np.array(pos, dtype=float))
         self.radii.append(float(radius))
@@ -224,30 +237,32 @@ class GreedyPacking:
                     'triplet':  tri,
                 })
 
-    def _compute_phi(self):
-        """当前状态的体积分数。"""
-        return self._compute_phi_for(self.positions, self.radii)
-
-    @staticmethod
-    def _compute_phi_for(positions, radii):
+    def _bbox_phi_incremental(self, sol, r_new, cur_sphere_vol):
         """
-        phi = 所有球的体积之和 / 最小轴对齐包围盒体积
-
-        包围盒由所有球的最外沿（球心 ± 半径）确定。
+        加入候选粒子后的全局包围盒体积分数（增量计算，避免重建 array）。
         """
-        if not positions:
-            return 0.0
+        new_vol = cur_sphere_vol + (4.0 / 3.0) * np.pi * r_new**3
 
-        pos = np.array(positions)   # (N, 3)
-        rad = np.array(radii)       # (N,)
-
-        lo = (pos - rad[:, None]).min(axis=0)   # (3,)
-        hi = (pos + rad[:, None]).max(axis=0)   # (3,)
-        dims = hi - lo                          # (3,)
-
-        box_vol = float(np.prod(dims))
+        pos = np.array(self.positions)
+        rad = np.array(self.radii)
+        lo  = (pos - rad[:, None]).min(axis=0)
+        hi  = (pos + rad[:, None]).max(axis=0)
+        lo  = np.minimum(lo, sol - r_new)
+        hi  = np.maximum(hi, sol + r_new)
+        box_vol = float(np.prod(hi - lo))
         if box_vol < 1e-12:
             return 0.0
+        return new_vol / box_vol
 
-        sphere_vol = float(np.sum((4.0 / 3.0) * np.pi * rad**3))
-        return sphere_vol / box_vol
+    def _compute_phi(self):
+        """全局体积分数（用于报告）：球体积之和 / 最小包围盒体积。"""
+        if not self.positions:
+            return 0.0
+        pos = np.array(self.positions)
+        rad = np.array(self.radii)
+        lo  = (pos - rad[:, None]).min(axis=0)
+        hi  = (pos + rad[:, None]).max(axis=0)
+        box_vol = float(np.prod(hi - lo))
+        if box_vol < 1e-12:
+            return 0.0
+        return float(np.sum((4.0 / 3.0) * np.pi * rad**3)) / box_vol
